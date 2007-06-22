@@ -1,4 +1,4 @@
--- 
+--
 -- Copyright (C) 2006 Johannes Hausensteiner (johannes.hausensteiner@pcl.at)
 -- 
 -- This program is free software; you can redistribute it and/or
@@ -24,6 +24,13 @@
 -- Changelog
 --
 --  0.1  25.Sep.2006   JH   new
+--  0.2  15.Nov.2006   JH   remove old code
+--  1.0   5.Feb.2007   JH   new clocking scheme
+--  1.1   4.Apr.2007   JH   implement high address byte
+--  1.2  16.Apr.2007   JH   clock enable
+--  1.3  23.Apr.2007   JH   remove all asynchronous elements
+--  1.4   4.May 2007   JH   resolve read timing
+--  1.5  10.May 2007   JH   remove read signal
 --
 
 
@@ -33,21 +40,27 @@ use ieee.std_logic_unsigned.all;
 
 entity spi_ctrl is
   port (
-    clk      : in std_logic;
+    clk_in   : in std_logic;
     rst      : in std_logic;
     spi_clk  : out std_logic;
     spi_cs   : out std_logic;
     spi_din  : in std_logic;
     spi_dout : out std_logic;
     sel      : in std_logic;
-    nWR      : in std_logic;
-    addr     : in std_logic_vector (1 downto 0);
+    wr       : in std_logic;
+    addr     : in std_logic_vector (2 downto 0);
     d_in     : in std_logic_vector (7 downto 0);
     d_out    : out std_logic_vector (7 downto 0)
   );
 end spi_ctrl;
 
 architecture rtl of spi_ctrl is
+  -- clock generator
+  constant SYS_FREQ  : integer :=  25000000;  -- 25MHz
+  constant SPI_FREQ  : integer :=   6250000;  -- 6.25MHz
+  signal clk_en : std_logic;
+  signal clk_cnt : integer range 0 to (SYS_FREQ/SPI_FREQ)-1;
+
   type state_t is (
     IDLE, TxCMD, TxADD_H, TxADD_M, TxADD_L, TxDUMMY, TxDATA, RxDATA,
     WAIT1, WAIT2, WAIT3, WAIT4, WAIT6, WAIT5, WAIT7, WAIT8, CLR_CMD);
@@ -60,13 +73,13 @@ architecture rtl of spi_ctrl is
 
   -- receiver
   signal rx_sreg : std_logic_vector (7 downto 0);
-  signal rx_ready, rx_ready_set : std_logic;
+  signal rx_ready, rx_ready_set, rx_bit_cnt_clr : std_logic;
   signal rx_bit_cnt : std_logic_vector (3 downto 0);
 
-  signal wr_cmd, wr_data, wr_add_m, wr_add_l : std_logic;
-  signal rd_stat, rd_add_m, rd_add_l : std_logic;
+  signal wr_cmd, wr_data, wr_add_h, wr_add_m, wr_add_l : std_logic;
+  signal rd_stat, rd_add_h, rd_add_m, rd_add_l : std_logic;
   signal rd_data, rd_data1, rd_data2 : std_logic;
-  signal spi_cs_int : std_logic;
+  signal spi_cs_int, spi_clk_int : std_logic;
 
   -- auxiliary signals
   signal rx_enable, rx_empty, rx_empty_clr : std_logic;
@@ -75,7 +88,8 @@ architecture rtl of spi_ctrl is
   signal cmd_clr, busy : std_logic;
 
   -- registers
-  signal cmd, tx_data, rx_data, add_m, add_l : std_logic_vector (7 downto 0);
+  signal cmd, tx_data, rx_data : std_logic_vector (7 downto 0);
+  signal add_h, add_m, add_l : std_logic_vector (7 downto 0);
   
   -- FLASH commands
   constant NOP  : std_logic_vector (7 downto 0) := x"FF";  -- no cmd to execute
@@ -83,7 +97,7 @@ architecture rtl of spi_ctrl is
   constant WRDI : std_logic_vector (7 downto 0) := x"04";  -- write disable
   constant RDSR : std_logic_vector (7 downto 0) := x"05";  -- read status reg
   constant WRSR : std_logic_vector (7 downto 0) := x"01";  -- write stat. reg
-  constant RD :   std_logic_vector (7 downto 0) := x"03";  -- read data
+  constant RDCMD: std_logic_vector (7 downto 0) := x"03";  -- read data
   constant F_RD : std_logic_vector (7 downto 0) := x"0B";  -- fast read data
   constant PP :   std_logic_vector (7 downto 0) := x"02";  -- page program
   constant SE :   std_logic_vector (7 downto 0) := x"D8";  -- sector erase
@@ -93,33 +107,65 @@ architecture rtl of spi_ctrl is
 begin
   -- assign signals
   spi_cs <= spi_cs_int;
-  spi_clk <= not ((tx_enable or rx_enable) and spi_cs_int)
-             or rx_ready or rx_ready_set or clk;
+  spi_clk <= spi_clk_int;
   spi_dout <= tx_sreg(7);
 
+  -- clock generator
+  spi_divider : process (rst, clk_in)
+    begin
+    if rst = '1' then
+      clk_cnt <= 0;
+      clk_en <= '0';
+      spi_clk_int <= '1';
+    elsif falling_edge (clk_in) then
+      if clk_cnt = ((SYS_FREQ / SPI_FREQ) - 2) or
+         clk_cnt = ((SYS_FREQ / SPI_FREQ) - 3) then
+        clk_cnt <= clk_cnt + 1;
+        clk_en <= '0';
+        if tx_enable = '1' or rx_enable = '1' then
+          spi_clk_int <= '0';
+        else
+          spi_clk_int <= '1';
+        end if;
+      elsif clk_cnt = ((SYS_FREQ / SPI_FREQ) - 1) then
+        clk_cnt <= 0;
+        clk_en <= '1';
+        spi_clk_int <= '1';
+      else
+        clk_cnt <= clk_cnt + 1;
+        clk_en <= '0';
+        spi_clk_int <= '1';
+      end if;
+    end if;
+  end process;
+
   -- address decoder
-  process (sel, addr, nWR)
-    variable input : std_logic_vector (3 downto 0);
+  process (sel, addr, wr)
+    variable input : std_logic_vector (4 downto 0);
   begin
-    input := sel & addr & nWR;
+    input := sel & addr & wr;
     -- defaults
     wr_data <= '0';
     wr_cmd <= '0';
+    wr_add_h <= '0';
     wr_add_m <= '0';
     wr_add_l <= '0';
     rd_data <= '0';
     rd_stat <= '0';
+    rd_add_h <= '0';
     rd_add_m <= '0';
     rd_add_l <= '0';
     case input is
-      when "1000" => wr_data  <= '1';
-      when "1001" => rd_data  <= '1';
-      when "1010" => wr_cmd   <= '1';
-      when "1011" => rd_stat  <= '1';
-      when "1100" => wr_add_m <= '1';
-      when "1101" => rd_add_m <= '1';
-      when "1110" => wr_add_l <= '1';
-      when "1111" => rd_add_l <= '1';
+      when "10000" => rd_data  <= '1';
+      when "10001" => wr_data  <= '1';
+      when "10010" => rd_stat  <= '1';
+      when "10011" => wr_cmd   <= '1';
+      when "10100" => rd_add_l <= '1';
+      when "10101" => wr_add_l <= '1';
+      when "10110" => rd_add_m <= '1';
+      when "10111" => wr_add_m <= '1';
+      when "11000" => rd_add_h <= '1';
+      when "11001" => wr_add_h <= '1';
       when others => null;
     end case;
   end process;
@@ -127,102 +173,134 @@ begin
   -- read back registers
   d_out(0) <=    (rx_data(0) and rd_data)
               or (busy       and rd_stat)
+              or (add_h(0)   and rd_add_h)
               or (add_m(0)   and rd_add_m)
               or (add_l(0)   and rd_add_l);
 
   d_out(1) <=    (rx_data(1) and rd_data)
               or (tx_empty   and rd_stat)
+              or (add_h(1)   and rd_add_h)
               or (add_m(1)   and rd_add_m)
               or (add_l(1)   and rd_add_l);
 
   d_out(2) <=    (rx_data(2) and rd_data)
               or (rx_ready   and rd_stat)
+              or (add_h(2)   and rd_add_h)
               or (add_m(2)   and rd_add_m)
               or (add_l(2)   and rd_add_l);
 
   d_out(3) <=    (rx_data(3) and rd_data)
               or (is_wait6   and rd_stat)
+              or (add_h(3)   and rd_add_h)
               or (add_m(3)   and rd_add_m)
               or (add_l(3)   and rd_add_l);
 
   d_out(4) <=    (rx_data(4) and rd_data)
               or ('0'        and rd_stat)
+              or (add_h(4)   and rd_add_h)
               or (add_m(4)   and rd_add_m)
               or (add_l(4)   and rd_add_l);
 
   d_out(5) <=    (rx_data(5) and rd_data)
               or ('0'        and rd_stat)
+              or (add_h(5)   and rd_add_h)
               or (add_m(5)   and rd_add_m)
               or (add_l(5)   and rd_add_l);
 
   d_out(6) <=    (rx_data(6) and rd_data)
               or ('0'        and rd_stat)
+              or (add_h(6)   and rd_add_h)
               or (add_m(6)   and rd_add_m)
               or (add_l(6)   and rd_add_l);
 
   d_out(7) <=    (rx_data(7) and rd_data)
               or ('0'        and rd_stat)
+              or (add_h(7)   and rd_add_h)
               or (add_m(7)   and rd_add_m)
               or (add_l(7)   and rd_add_l);
 
   -- write command register
-  process (rst, cmd_clr, wr_cmd)
+  process (rst, cmd_clr, clk_in)
   begin
     if rst = '1' or cmd_clr = '1' then
       cmd <= NOP;
-    elsif falling_edge (wr_cmd) then
-      cmd <= d_in;
+    elsif rising_edge (clk_in) then
+      if wr_cmd = '1' then
+        cmd <= d_in;
+      end if;
+    end if;
+  end process;
+
+  -- write address high register
+  process (rst, clk_in)
+  begin
+    if rst = '1' then
+      add_h <= x"00";
+    elsif rising_edge (clk_in) then
+      if wr_add_h = '1' then
+        add_h <= d_in;
+      end if;
     end if;
   end process;
 
   -- write address mid register
-  process (rst, wr_add_m)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       add_m <= x"00";
-    elsif falling_edge (wr_add_m) then
-      add_m <= d_in;
+    elsif rising_edge (clk_in) then
+      if wr_add_m ='1' then
+        add_m <= d_in;
+      end if;
     end if;
   end process;
 
   -- write address low register
-  process (rst, wr_add_l)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       add_l <= x"00";
-    elsif falling_edge (wr_add_l) then
-      add_l <= d_in;
+    elsif rising_edge (clk_in) then
+      if wr_add_l ='1' then
+        add_l <= d_in;
+      end if;
     end if;
   end process;
 
   -- write tx data register
-  process (rst, wr_data)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       tx_data <= x"00";
-    elsif falling_edge (wr_data) then
-      tx_data <= d_in;
+    elsif rising_edge (clk_in) then
+      if wr_data = '1' then
+        tx_data <= d_in;
+      end if;
     end if;
   end process;
 
   -- new tx data flag
   tx_new_data_clr <= tx_empty_set and is_tx_data;
-  process (rst, tx_new_data_clr, wr_data)
+  process (rst, tx_new_data_clr, clk_in)
   begin
     if rst = '1' or tx_new_data_clr = '1' then
       tx_new_data <= '0';
-    elsif falling_edge (wr_data) then
-      tx_new_data <= '1';
+    elsif rising_edge (clk_in) then
+      if wr_data ='1' then
+        tx_new_data <= '1';
+      end if;
     end if;
   end process;
 
   -- advance the state machine
-  process (rst, clk)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       state <= IDLE;
-    elsif rising_edge (clk) then
-      state <= next_state;
+    elsif rising_edge (clk_in) then
+      if clk_en = '1' then
+        state <= next_state;
+      end if;
     end if;
   end process;
 
@@ -240,13 +318,17 @@ begin
         if tx_bit_cnt < x"7" then
           next_state <= TxCMD;
         else
-          next_state <= WAIT1;
+          case cmd is
+            when WREN | WRDI | BE | DP => next_state <= CLR_CMD;
+            when SE | PP | RES | RDCMD | F_RD|WRSR|RDSR => next_state <= WAIT1;
+            when others => next_state <= CLR_CMD;
+          end case;
         end if;
 
       when WAIT1 =>
         case cmd is
           when WREN | WRDI | BE | DP => next_state <= CLR_CMD;
-          when SE | PP | RES | RD | F_RD => next_state <= TxADD_H;
+          when SE | PP | RES | RDCMD | F_RD => next_state <= TxADD_H;
           when WRSR => next_state <= TxDATA;
           when RDSR => next_state <= RxDATA;
           when others => next_state <= CLR_CMD;
@@ -276,7 +358,7 @@ begin
         else
           case cmd is
             when PP => next_state <= WAIT6;
-            when SE | RES | RD | F_RD => next_state <= WAIT4;
+            when SE | RES | RDCMD | F_RD => next_state <= WAIT4;
             when others => next_state <= CLR_CMD;
           end case;
         end if;
@@ -284,7 +366,7 @@ begin
       when WAIT4 =>
         case cmd is
           when F_RD => next_state <= TxDUMMY;
-          when RES | RD => next_state <= RxDATA;
+          when RES | RDCMD => next_state <= RxDATA;
           when others => next_state <= CLR_CMD;
         end case;
 
@@ -299,7 +381,7 @@ begin
 
       when WAIT8 =>
         case cmd is
-          when RD | F_RD =>
+          when RDCMD | F_RD =>
             if rx_empty = '1' then
               next_state <= RxDATA;
             else
@@ -313,7 +395,7 @@ begin
           next_state <= RxDATA;
         else
           case cmd is
-            when RD | F_RD => next_state <= WAIT7;
+            when RDCMD | F_RD => next_state <= WAIT7;
             when RDSR | RES => next_state <= WAIT5;
             when others => next_state <= CLR_CMD;
           end case;
@@ -347,11 +429,12 @@ begin
   end process;
 
   -- state machine output table
-  process (state)
+  process (state, cmd, tx_data, add_m, add_l, add_h)
   begin
     -- default values
     tx_enable <= '0';
     rx_enable <= '0';
+    rx_bit_cnt_clr <= '1';
     tx_reg <= x"FF";
     spi_cs_int <= '0';
     busy <= '1';
@@ -372,7 +455,7 @@ begin
         spi_cs_int <= '1';
         is_tx_data <= '1';
       when TxADD_H =>
-        tx_reg <= x"0F";
+        tx_reg <= add_h;
         tx_enable <= '1';
         spi_cs_int <= '1';
       when TxADD_M =>
@@ -388,6 +471,7 @@ begin
         tx_enable <= '1';
         spi_cs_int <= '1';
       when RxDATA =>
+        rx_bit_cnt_clr <= '0';
         rx_enable <= '1';
         spi_cs_int <= '1';
       when WAIT1 | WAIT2 | WAIT3 | WAIT4 | WAIT8 =>
@@ -396,7 +480,7 @@ begin
         is_wait6 <= '1';
         spi_cs_int <= '1';
       when WAIT5 | WAIT7 =>
-        rx_enable <= '1';
+        rx_bit_cnt_clr <= '0';
         spi_cs_int <= '1';
       when CLR_CMD =>
         cmd_clr <= '1';
@@ -405,79 +489,80 @@ begin
   end process;
 
   -- the tx_empty flip flop
-  process (rst, tx_empty_set, wr_data)
+  process (rst, wr_data, clk_in)
   begin
     if rst = '1' then
       tx_empty <= '1';
     elsif wr_data = '1' then
       tx_empty <= '0';
-    elsif rising_edge (tx_empty_set) then
-      tx_empty <= '1';
+    elsif rising_edge (clk_in) then
+      if tx_empty_set = '1' then
+        tx_empty <= '1';
+      end if;
     end if;
   end process;
 
   -- delay the tx_enable signal
-  process (rst, clk)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       tx_enable_d <= '0';
-    elsif falling_edge (clk) then
+    elsif rising_edge (clk_in) then
       tx_enable_d <= tx_enable;
     end if;
   end process;
 
   -- transmitter shift register and bit counter
-  process (rst, tx_enable_d, clk)
+  process (rst, tx_reg, tx_enable_d, clk_in)
   begin
-    if rst = '1' or tx_enable_d = '0' then
+    if rst = '1' then
+      tx_sreg <= x"FF";
+      tx_bit_cnt <= x"0";
+      tx_empty_set <= '0';
+    elsif tx_enable_d = '0' then
       tx_sreg <= tx_reg;
       tx_bit_cnt <= x"0";
       tx_empty_set <= '0';
-    elsif falling_edge (clk) then
-      tx_bit_cnt <= tx_bit_cnt + 1;
-
-      tx_sreg(7) <= tx_sreg(6);
-      tx_sreg(6) <= tx_sreg(5);
-      tx_sreg(5) <= tx_sreg(4);
-      tx_sreg(4) <= tx_sreg(3);
-      tx_sreg(3) <= tx_sreg(2);
-      tx_sreg(2) <= tx_sreg(1);
-      tx_sreg(1) <= tx_sreg(0);
-      tx_sreg(0) <= '1';
-
-      if tx_bit_cnt = x"6" and is_tx_data = '1' then
-        tx_empty_set <= '1';
-      else
-        tx_empty_set <= '0';
+    elsif rising_edge (clk_in) then
+      if clk_en = '1' then
+        tx_bit_cnt <= tx_bit_cnt + 1;
+        tx_sreg <= tx_sreg (6 downto 0) & '1';
+        if tx_bit_cnt = x"6" and is_tx_data = '1' then
+          tx_empty_set <= '1';
+        else
+          tx_empty_set <= '0';
+        end if;
       end if;
     end if;
   end process;
 
-  -- capture rd_data
-  process (rst, rd_data, rd_data2)
+  -- synchronize rd_data
+  process (rst, clk_in)
   begin
-    if rst = '1' or rd_data2 = '1' then
+    if rst = '1' then
       rd_data1 <= '0';
-    elsif rising_edge (rd_data) then
-      rd_data1 <= '1';
+    elsif falling_edge (clk_in) then
+      rd_data1 <= rd_data;
     end if;
   end process;
 
-  process (rst, clk)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       rd_data2 <= '0';
-    elsif rising_edge (clk) then
-      rd_data2 <= rd_data1;
+    elsif falling_edge (clk_in) then
+      if rd_data = '0' then
+        rd_data2 <= rd_data1;
+      end if;
     end if;
   end process;
 
   -- the rx_empty flip flop
-  process (rst, clk)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       rx_empty <= '1';
-    elsif falling_edge (clk) then
+    elsif rising_edge (clk_in) then
       if rx_empty_clr = '1' then
         rx_empty <= '0';
       elsif rd_data2 = '1' then
@@ -487,12 +572,12 @@ begin
   end process;
 
   -- the rx_ready flip flop
-  process (rst, clk)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       rx_ready <= '0';
-    elsif falling_edge (clk) then
-      if rd_data2 = '1' then
+    elsif rising_edge (clk_in) then
+      if rd_data = '1' then
         rx_ready <= '0';
       elsif rx_ready_set = '1' then
         rx_ready <= '1';
@@ -501,11 +586,11 @@ begin
   end process;
 
   -- the rx_data register
-  process (rst, clk)
+  process (rst, clk_in)
   begin
     if rst = '1' then
       rx_data <= x"FF";
-    elsif falling_edge (clk) then
+    elsif rising_edge (clk_in) then
       if rx_ready_set = '1' then
         rx_data <= rx_sreg;
       end if;
@@ -513,35 +598,32 @@ begin
   end process;
 
   -- receiver shift register and bit counter
-  process (rst, rx_enable, clk)
+  process (rst, rx_bit_cnt_clr, clk_in)
   begin
-    if rst = '1' or rx_enable = '0' then
+    if rst = '1' or rx_bit_cnt_clr = '1' then
       rx_bit_cnt <= x"0";
       rx_ready_set <= '0';
       rx_empty_clr <= '0';
       rx_sreg <= x"FF";
-    elsif rising_edge (clk) then
-      rx_bit_cnt <= rx_bit_cnt + 1;
-
-      rx_sreg(7) <= rx_sreg(6);
-      rx_sreg(6) <= rx_sreg(5);
-      rx_sreg(5) <= rx_sreg(4);
-      rx_sreg(4) <= rx_sreg(3);
-      rx_sreg(3) <= rx_sreg(2);
-      rx_sreg(2) <= rx_sreg(1);
-      rx_sreg(1) <= rx_sreg(0);
-      rx_sreg(0) <= spi_din;
-
-      if rx_bit_cnt = x"1" then
-        rx_empty_clr <= '1';
-      else
-        rx_empty_clr <= '0';
-      end if;
-
-      if rx_bit_cnt = x"7" then
-        rx_ready_set <= '1';
-      else
-        rx_ready_set <= '0';
+    elsif rising_edge (clk_in) then
+      if clk_en = '1' then
+        rx_sreg <= rx_sreg (6 downto 0) & spi_din;
+        case rx_bit_cnt is
+          when x"0" =>
+            rx_bit_cnt <= rx_bit_cnt + 1;
+            rx_ready_set <= '0';
+            rx_empty_clr <= '1';
+          when x"1" | x"2" | x"3" | x"4" | x"5" | x"6" =>
+            rx_bit_cnt <= rx_bit_cnt + 1;
+            rx_ready_set <= '0';
+            rx_empty_clr <= '0';
+          when x"7" =>
+            rx_bit_cnt <= rx_bit_cnt + 1;
+            rx_ready_set <= '1';
+            rx_empty_clr <= '0';
+          when others =>
+            null;
+        end case;
       end if;
     end if;
   end process;
