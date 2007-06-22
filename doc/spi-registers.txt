@@ -9,10 +9,7 @@ DIY calculator address space:
   $F019 : status register  (read)
   $F03A : address low register (write)
   $F03B : address mid register (write)
-  $F03B : address high register (write)
-
-The high address byte is fixed to $0F, denoting the last segment within
-the flash (8MBit type assumed).
+  $F03C : address high register (write)
 
 
 These are the bits of the status register:
