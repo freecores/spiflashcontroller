@@ -7,17 +7,19 @@ DIY calculator address space:
   $F018 : Rx data register (read)
   $F039 : command register (write)
   $F019 : status register  (read)
-  $F03A : address mid register (write)
-  $F03B : address low register (write)
+  $F03A : address low register (write)
+  $F03B : address mid register (write)
+  $F03B : address high register (write)
 
 The high address byte is fixed to $0F, denoting the last segment within
 the flash (8MBit type assumed).
 
 
 These are the bits of the status register:
-  busy:     $01
-  tx empty: $02
-  rx ready: $04
+  busy:          $01
+  tx empty:      $02
+  rx ready:      $04
+  wait for data: $08
 Other bits read as '0'.
 
 
@@ -106,8 +108,15 @@ WAIT:      LDA     [SPI_STAT]
            LDA     [SPI_RX]           
 
 3) issue the "Sector Erase" command:
-           LDA     0
+; symbolic constant 
+SECTOR     .EQU    $0F       ; sector number
+             .
+             .
+             .
+           LDA     SECTOR
            STA     [SPI_AHI]
+           LDA     0
+           STA     [SPI_AMID]
            STA     [SPI_ALO]
            LDA     SPI_SE
            STA     [SPI_CMD]
@@ -130,8 +139,10 @@ NUMBYTES:  .WORD
 ; code:
            BLDX    BUFSIZE
            BSTX    [MAXBYTES]
-           LDA     BUF
+           LDA     SECTOR
            STA     [SPI_AHI]
+           LDA     BUF
+           STA     [SPI_AMID]
            LDA     BUF+1
            STA     [SPI_ALO]
            LDA     SPI_RD
@@ -165,10 +176,8 @@ Remarks:
 --------
 The flash utilizes a 3 byte address (using 20 bits for the 8Mbit
 M25P80 chip). The highest byte specifies the sector on which the PP, SE,
-RD, F_RD commands operate. Currently we use only the topmost sector
-(no. 0x0F). This is no restriction in size of memory since one sector
-is 64KB in size. But it saves the additional high byte address register.
-The high byte (0x0F) is hardwired inside the SPI Flash controller.
+RD, F_RD commands operate. In the DIY Calculator we use only the topmost
+sector (no. 0x0F).
 
 The PP, RD, and F_RD commands are special in that that the number of bytes
 to be transferred is not known in advance. Therefore the dummy "NOP" command
